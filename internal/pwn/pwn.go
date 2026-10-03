@@ -22,147 +22,128 @@ var KEY_POOL = []byte{
 	0x6f, 0x76, 0xce, 0x79, 0x4f, 0x49,
 }
 
-func noneMap(i int) int {
-	return i
-}
-func byteMap(i int) int {
-	return i & 0xff
-}
-func evaluateAlphabet(alphabet string, exponent int, modulus int, valueMap func(i int) int) map[int]int {
-	possibleValues := make(map[int]int)
-	alphabetBytes := []byte(alphabet)
+const (
+	rsaN   = 30049
+	rsaPhi = 29700
+)
 
-	// Generate all possible 4-byte combinations of alphabet
-	for _, b1 := range alphabetBytes {
-		for _, b2 := range alphabetBytes {
-			for _, b3 := range alphabetBytes {
-				for _, b4 := range alphabetBytes {
-					combination := []byte{b1, b2, b3, b4}
-					num := intLittle(combination)
-					result := valueMap(modPow(num, exponent, modulus))
+type PayloadStruct struct {
+	Header        [4]uint32
+	PonMac        [6]uint32
+	ClientMac     [6]uint32
+	ClientMacRend [6]uint32
+	Key           [6]uint32
+	KeyRend       [6]uint32
+}
 
-					if _, exists := possibleValues[result]; !exists {
-						possibleValues[result] = num
-					}
-				}
-			}
+func gcd(a, b uint32) uint32 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func modPow(base, exp, mod uint32) uint32 {
+	if mod == 1 {
+		return 0
+	}
+	result := uint64(1)
+	b := uint64(base % mod)
+	e := uint64(exp)
+	m := uint64(mod)
+	for e > 0 {
+		if e&1 == 1 {
+			result = (result * b) % m
+		}
+		b = (b * b) % m
+		e >>= 1
+	}
+	return uint32(result)
+}
+
+func modInverse(a, m uint32) uint32 {
+	if gcd(a, m) != 1 {
+		return 0
+	}
+	var x0, x1 int64 = 1, 0
+	aa, mm := int64(a), int64(m)
+	for mm != 0 {
+		q := aa / mm
+		aa, mm = mm, aa-q*mm
+		x0, x1 = x1, x0-q*x1
+	}
+	if x0 < 0 {
+		x0 += int64(m)
+	}
+	return uint32(x0)
+}
+
+func CreatePayloadArray(reRand uint32, serverMac, clientMac []byte, idx int) *PayloadStruct {
+	if len(serverMac) < 6 || len(clientMac) < 6 {
+		return nil
+	}
+
+	key := [6]byte{0x00, 0xFF, 0x72, 0x46, 0x34, 0x11}
+
+	idxU := uint32(idx)
+
+	var accum uint32 = 1
+	for i := 0; i < 6; i++ {
+		val1 := idxU + uint32(serverMac[i])
+		val2 := reRand ^ val1
+		accum = accum * val2
+	}
+	rsaSeed := accum & 0x1FFF
+
+	var (
+		s0, s1, s2 uint32 = 1, 0, 1
+		eDyn, dDyn uint32
+		found      bool
+	)
+
+	for attempt := 0; attempt < 100; attempt++ {
+		tempS0 := uint32(2)
+		tempS1 := uint32(attempt)
+		tempS2 := uint32(2)
+		eDyn = (tempS0 * rsaSeed) + tempS1
+
+		if gcd(eDyn, rsaPhi) == 1 && eDyn >= 3 && eDyn < 100000 {
+			s0, s1, s2 = tempS0, tempS1, tempS2
+			found = true
+			break
 		}
 	}
-
-	return possibleValues
-}
-func intLittle(data []byte) int {
-	var result int
-	for i := len(data) - 1; i >= 0; i-- {
-		result = (result << 8) | int(data[i])
-	}
-	return result
-}
-func intFromBytes(data []byte, order string) int {
-	var result int
-	if order == "little" {
-		for i := len(data) - 1; i >= 0; i-- {
-			result = (result << 8) | int(data[i])
-		}
-	} else { // big endian
-		for i := 0; i < len(data); i++ {
-			result = (result << 8) | int(data[i])
-		}
-	}
-	return result
-}
-
-func modPow(base, exp, mod int) int {
-	result := 1
-	base %= mod
-	for exp > 0 {
-		if exp%2 == 1 {
-			result = (result * base) % mod
-		}
-		exp >>= 1
-		base = (base * base) % mod
-	}
-	return result
-}
-
-const alphabet = "lmaoztebcdfghijknpqrsuvwxy"
-const modulus = 0x1687
-const modulus2 = 0x7561
-
-var headerEncodingMap, macEncodingMap map[int]int
-
-func init() {
-	headerEncodingMap = evaluateAlphabet(alphabet, modulus, modulus2, noneMap)
-	macEncodingMap = evaluateAlphabet(alphabet, 0x1, modulus, byteMap)
-}
-
-func CreatePayloadArray(localMac, remoteMac []byte, calculatedIdx int) []int {
-	var payload []int
-
-	// exponent
-	payload = append(payload, headerEncodingMap[0]) // input1; cancels out calculated_idx
-	payload = append(payload, headerEncodingMap[1]) // input2; selected exponent
-
-	// modulus
-	payload = append(payload, headerEncodingMap[0])       // input3; cancels out calculated_idx
-	payload = append(payload, headerEncodingMap[modulus]) // input4; selected modulus
-
-	// Add local and remote MAC addresses to payload
-	macBytes := append(localMac, remoteMac...)
-	macBytes = append(macBytes, remoteMac...)
-
-	for _, b := range macBytes {
-		payload = append(payload, macEncodingMap[int(b)])
+	if !found {
+		return nil
 	}
 
-	return payload
-}
+	eDyn = (s0 * rsaSeed) + s1
+	dDyn = modInverse(eDyn, rsaPhi)
+	s3 := rsaN - ((s2 * rsaSeed) % rsaN)
 
-// VerifyDoCheckClient should be a faithful implementation of what is implemented in the vm bytecode for
-// do_check_client in the httpd binary.
-func VerifyDoCheckClient(clientData []int, remoteMacAddress []byte, calculatedIdx int, localMacAddress []byte) bool {
-	processedWord0 := modPow(clientData[0], modulus, modulus2)
-	processedWord1 := modPow(clientData[1], modulus, modulus2)
-	processedWord2 := modPow(clientData[2], modulus, modulus2)
-	processedWord3 := modPow(clientData[3], modulus, modulus2)
+	buffer := &PayloadStruct{}
 
-	derivedExponent := (processedWord0 * calculatedIdx) + processedWord1
-	derivedModulus := (processedWord2 * calculatedIdx) + processedWord3
-
-	clientData = clientData[4:]
-	remainingWordLen := len(clientData)
-	workBuffer := make([]byte, len(clientData))
-
-	if remainingWordLen < 6 {
-		fmt.Printf("Warning: Remaining client_data words are less than 6\n")
-		return false
-	}
+	buffer.Header[0] = modPow(s0, 103, rsaN)
+	buffer.Header[1] = modPow(s1, 103, rsaN)
+	buffer.Header[2] = modPow(s2, 103, rsaN)
+	buffer.Header[3] = modPow(s3, 103, rsaN)
 
 	for i := 0; i < 6; i++ {
-		workBuffer[i] = byte(modPow(clientData[i], derivedExponent, derivedModulus) & 0xFF)
+		buffer.PonMac[i] = modPow(uint32(serverMac[i]), dDyn, rsaN)
 	}
-
-	calculatedLocalMac := workBuffer[:6]
-	if string(calculatedLocalMac) != string(localMacAddress) {
-		fmt.Printf("local mismatch %x != %x\n", calculatedLocalMac, localMacAddress)
-		return false
+	for i := 0; i < 6; i++ {
+		buffer.ClientMac[i] = modPow(uint32(clientMac[i]), dDyn, rsaN)
 	}
+	buffer.ClientMacRend = buffer.ClientMac
 
-	for i := 6; i < remainingWordLen; i++ {
-		workBuffer[i] = byte(modPow(clientData[i], derivedExponent, derivedModulus) & 0xFF)
-
-		if i >= 6 && (i+1)%6 == 0 {
-			calculatedRemoteMac := workBuffer[i-5 : i+1]
-			if string(calculatedRemoteMac) != string(remoteMacAddress) {
-				fmt.Printf("local mismatch %x != %x\n", calculatedRemoteMac, remoteMacAddress)
-				continue
-			}
-			return true
-		}
+	for i := 0; i < 6; i++ {
+		buffer.Key[i] = modPow(uint32(key[i]), dDyn, rsaN)
 	}
+	buffer.KeyRend = buffer.Key
 
-	return false
+	return buffer
 }
+
 func ParseMac(inputStr string) ([]byte, error) {
 	cleaned := strings.ReplaceAll(inputStr, ":", "")
 	if len(cleaned)%2 != 0 {
@@ -203,14 +184,26 @@ func createAesEcbCipher(aesKey []byte) cipher.Block {
 	return block
 }
 
-func BuildPayloadString(payloadArr []int) string {
-	payloadBytes := make([]byte, len(payloadArr)*4)
-	for i, val := range payloadArr {
-		binary.LittleEndian.PutUint32(payloadBytes[i*4:(i+1)*4], uint32(val))
+func BuildPayloadString(p *PayloadStruct) string {
+	if p == nil {
+		return ""
+	}
+
+	vals := make([]uint32, 0, 34)
+	vals = append(vals, p.Header[:]...)
+	vals = append(vals, p.PonMac[:]...)
+	vals = append(vals, p.ClientMac[:]...)
+	vals = append(vals, p.ClientMacRend[:]...)
+	vals = append(vals, p.Key[:]...)
+	vals = append(vals, p.KeyRend[:]...)
+
+	payloadBytes := make([]byte, len(vals)*4)
+	for i, val := range vals {
+		binary.LittleEndian.PutUint32(payloadBytes[i*4:(i+1)*4], val)
 	}
 
 	payloadStr := string(payloadBytes)
-	return fmt.Sprintf("SendInfo.gch?info=%d|%s", len(payloadArr), payloadStr)
+	return fmt.Sprintf("SendInfo.gch?info=%d|%s", len(vals), payloadStr)
 }
 
 func EncryptAES(block cipher.Block, data []byte) ([]byte, error) {

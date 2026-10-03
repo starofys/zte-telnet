@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - goos: windows
+            goarch: 386
+          - goos: windows
+            goarch: amd64
+          # Linux x86
+          - goos: linux
+            goarch: 386
+          - goos: linux
+            goarch: amd64
+          # Linux ARM 32
+          - goos: linux
+            goarch: arm
+            goarm: 7
+          - goos: linux
+            goarch: arm
+            goarm: 6
+          # Linux ARM 64 (aarch64)
+          - goos: linux
+            goarch: arm64
+          # macOS
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          output="zte-telnet-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [ "${{ matrix.goarch }}" = "arm" ]; then
+            output="${output}v${{ matrix.goarm }}"
+          fi
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            output="${output}.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "$output" ./cmd
+          ls -lh "$output"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zte-telnet-*
+          body: |
+            ## Changes
+            - 修改客户端验证载荷生成算法，严格遵守工厂模式协议进行载荷计算
+            - 支持2024年10月到2026年6月这一时间段的工厂模式协议
+            - 新增 `-s` 参数，支持通过FTTR主网关使能从网关的Telnet
+            - 添加默认的工厂模式默认用户名密码，长按复位键15秒，网关重启后可以使用。
